@@ -1,6 +1,21 @@
 # encoding: utf-8
 
-from multiprocessing import Pool, Manager
+"""
+本项目基于 multiprocessing 中的 Pool / Queue / Manager，并使用了哨兵机制，来实现一个多进程任务流转管道
+目前只支持单线型的管道，最后一个节点必须为单进程；每个节点都通过哨兵来判断前面的节点是否已经运行完毕
+
+由于采用的是 Queue 和 Pool.apply_async，故此，调用的函数、函数的参数都通过 pickle 来序列化
+比如 Pool.apply_async(proc, [args, [kwds, [callback]]])，这里面的 proc, callback 以及在 args 或者 kwds 中的变量和函数统统都要被 pickle
+而 python 目前能够被序列化的类型有限，尤其是对于函数来说，类成员函数不能被 pickle，不是在文件最外层定义的函数也不能被 pickle
+而且如果是一个类实例对象，而这个对象中含有 Manager / Pool / AsyncResult 或其他复杂的对象为成员变量的话，很可能也不能被 pickle
+故此，这里采取了一些曲折的方法，最终实现了这个多进程运行框架
+
+参见：
+https://stackoverflow.com/questions/25071910/multiprocessing-pool-calling-helper-functions-when-using-apply-asyncs-callback
+https://stackoverflow.com/questions/8804830/python-multiprocessing-pickling-error
+"""
+
+from multiprocessing import Pool, Manager, cpu_count
 
 
 class SentinelPipelineNode(object):
@@ -10,10 +25,10 @@ class SentinelPipelineNode(object):
         self.proc = proc
         self.num_cores = num_cores
         self.queue = None
-        self.prev_node = None    # 知道前一个节点，以便从其 queue 中读取数据；尾节点还可以知道哨兵已经完成的个数
-        self.next_node = None    # 知道后一个节点，以便在本 queue 中为其设置哨兵
-        self.sentinel = sentinel
-        self.processes = []      # 本节点的全部运行进程，用于等待全部进程完毕，设置哨兵
+        self.prev_node = None     # 知道前一个节点，以便从其 queue 中读取数据；尾节点还可以知道哨兵已经完成的个数
+        self.next_node = None     # 知道后一个节点，以便在本 queue 中为其设置哨兵
+        self.sentinel = sentinel  # 哨兵变量，前一个节点需要设置本节点的哨兵变量
+        self.processes = []       # 本节点的全部运行进程，用于等待全部进程完毕，设置哨兵
 
     def set_next_node(self, node):
         self.next_node = node
@@ -42,7 +57,7 @@ class SentinelPipelineNode(object):
 
 def start_proc(q, proc, *args, **kwargs):
     """ 注意，这里也不能把 node 自身直接通过 apply_async 传过来，因为其内部含有很多不能 pickle 的成员变量
-        故此，这里的做法是只把用到的成员变量传过来
+        故此，这里的做法是只把用到的成员变量传过来；注意，这个 proc 必须是在文件的最外层定义
     """
     for rec in proc(*args, **kwargs):
         q.put(rec)
@@ -63,11 +78,9 @@ class SentinelPipelineStart(SentinelPipelineNode):
         因为多进程之间要使用pickle来序列化并传递一些数据，但是实例方法并不能被pickle
         能被 pickle 的类型列表： https://docs.python.org/2/library/pickle.html#what-can-be-pickled-and-unpickled
 
-        # args 第一个是 queue，需要提取出来
-        def start_proc(*args, **kwargs):
+        def start_proc(*args, **kwargs):    # 这是一个内层定义的函数，无法被 pickle
             for rec in self.proc(*args[1:], **kwargs):
                 args[0].put(rec)
-        # 启动 proc 在 queue 中添加数据
         for _ in range(self.num_cores):
             # apply_async 要求直接传 args 和 kwargs，而不是 *args & **kwargs
             # 把 queue 也传到进程里，multiprocess.Queue 有 pickle 方法可以被序列化
@@ -97,19 +110,7 @@ class SentinelPipelineStep(SentinelPipelineNode):
         self.queue = self.manager.Queue()
 
     def run(self, *args, **kwargs):
-        """
-        # args 前两个分别为 recv 和 send queue
-        def invoke_proc(*args, **kwargs):
-            while True:
-                rec = args[0].get()
-                if rec == self.sentinel:
-                    return
-                args[1].put(self.proc(rec, *args[2:], **kwargs))
-        """
         for _ in range(self.num_cores):
-            """
-            self.processes.append(self.pool.apply_async(invoke_proc, (self.proc, self.prev_node.queue, self.queue,) + args, kwargs))
-            """
             self.processes.append(self.pool.apply_async(invoke_proc, (self.prev_node.queue, self.queue, self.proc, self.sentinel,) + args, kwargs))
 
 
@@ -136,19 +137,7 @@ class SentinelPipelineEnd(SentinelPipelineNode):
         self.num_cores = 1
 
     def run(self, *args, **kwargs):
-        """
-        # args 第一个节点为 recv queue
-        def end_proc(*args, **kwargs):
-            def data_generator(q):
-                while True:
-                    rec = q.get()
-                    if rec == self.sentinel:
-                        return
-                    yield rec
-            return self.proc(data_generator(args[0]), *args[1:], **kwargs)
-
-        self.processes.append(self.pool.apply_async(end_proc, (self.prev_node.queue,) + args, kwargs))
-        """
+        # 单进程
         self.processes.append(self.pool.apply_async(end_proc, (self.prev_node.queue, self.proc, self.sentinel,) + args, kwargs))
 
 
@@ -159,7 +148,7 @@ class SentinelPipeline(object):
     """
     def __init__(self, pool_size=None):
         self.manager = Manager()
-        self.pool = Pool()    # TODO
+        self.pool = Pool(cpu_count())
         self.graph = []
 
     def start_with(self, proc, num_cores, sentinel, *args, **kwargs):
@@ -217,6 +206,7 @@ def train(data):
 
 
 def test_1_simple():
+    print "----------------- test 1 --------------------"
     sp = SentinelPipeline()
     sp.start_with(feed, 1, None)
     sp.pipe_with(process, 8, None)
@@ -225,5 +215,41 @@ def test_1_simple():
     print result
 
 
+"""  Test 2. 多个慢速 feeder
+
+2 个 feed =>  8 个 process  =>  1 个 train 的图
+
+feeder 随机睡眠，这里意在测试流程各节点可以交错运行，而不是一个节点上的多个进程都运行完毕才能进行下一个节点
+
+"""
+
+
+# 生成器，用于 Start 节点
+def feed2():
+    import random
+    import time
+    for i in range(10):
+        time.sleep(random.randint(1, 5))
+        print "feed: {}".format(i)
+        yield i
+
+
+# 转换器，用于 Step 节点
+def process2(i):
+    print "process: {}".format(i)
+    return i * 2
+
+
+def test_2_simple():
+    print "----------------- test 2 --------------------"
+    sp = SentinelPipeline()
+    sp.start_with(feed2, 2, None)
+    sp.pipe_with(process2, 8, None)
+    sp.end_with(train, 1, None)
+    result = sp.run()
+    print result
+
+
 if __name__ == "__main__":
     test_1_simple()
+    test_2_simple()
