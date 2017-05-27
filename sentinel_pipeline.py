@@ -96,7 +96,8 @@ def invoke_proc(recv_q, send_q, proc, sentinel, *args, **kwargs):
         rec = recv_q.get()
         if rec == sentinel:
             return
-        send_q.put(proc(rec, *args, **kwargs))
+        for processed in proc(rec, *args, **kwargs):
+            send_q.put(processed)
 
 
 class SentinelPipelineStep(SentinelPipelineNode):
@@ -194,7 +195,7 @@ def feed():
 
 # 转换器，用于 Step 节点
 def process(i):
-    return i * 2
+    yield i * 2
 
 
 # 接收生成器为参数，用于 End 节点
@@ -237,7 +238,7 @@ def feed2():
 # 转换器，用于 Step 节点
 def process2(i):
     print "process: {}".format(i)
-    return i * 2
+    yield i * 2
 
 
 def test_2_simple():
