@@ -124,3 +124,6 @@ for d in r.get():
         print k, w.value
 # for key, word in ws.words.iteritems():
 #    print key, word.value
+
+pool.close()
+pool.join()
