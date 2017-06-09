@@ -4,7 +4,7 @@
 本项目基于 multiprocessing 中的 Pool / Queue / Manager，并使用了哨兵机制，来实现一个多进程任务流转管道
 目前只支持单线型的管道，最后一个节点必须为单进程；每个节点都通过哨兵来判断前面的节点是否已经运行完毕
 
-由于采用的是 Queue 和 Pool.apply_async，故此，调用的函数、函数的参数都通过 pickle 来序列化
+由于采用的是 Queue 和 Pool.apply_async，故此，调用的函数、函数的参数都通过 pickle 来序列化，故此最好定义在最外层，也不能使用 decorator
 比如 Pool.apply_async(proc, [args, [kwds, [callback]]])，这里面的 proc, callback 以及在 args 或者 kwds 中的变量和函数统统都要被 pickle
 而 python 目前能够被序列化的类型有限，尤其是对于函数来说，类成员函数不能被 pickle，不是在文件最外层定义的函数也不能被 pickle
 而且如果是一个类实例对象，而这个对象中含有 Manager / Pool / AsyncResult 或其他复杂的对象为成员变量的话，很可能也不能被 pickle
@@ -41,8 +41,9 @@ class SentinelPipelineNode(object):
 
     def set_sentinels(self):
         """
-        注意调用时机
-        因为这个函数是 blocking 的
+        注意调用时机，这个函数是 blocking ( p.get() ) 的
+        不是所有步骤的节点同时设置哨兵，而是每个节点运行完毕 (p.get() block 运行完毕) 后，才设置下一步骤的哨兵
+        不过，反正第二步不可能比第一步更早结束，故此没有问题
         """
         # End 节点为单进程就不需要安置哨兵了
         if self.next_node is None:
@@ -67,6 +68,7 @@ class SentinelPipelineStart(SentinelPipelineNode):
     """
     可以多进程运行
     每个进程从一个生成器中读取数据，并插入 queue
+    不过，由于多个进程共享 *args 和 **kwarg，故此，通常只是单进程使用
     """
     def __init__(self, pipeline, proc, num_cores, sentinel):
         super(SentinelPipelineStart, self).__init__(pipeline, proc, num_cores, sentinel)
@@ -74,7 +76,7 @@ class SentinelPipelineStart(SentinelPipelineNode):
 
     def run(self, *args, **kwargs):
         """
-        曾经这样写，但是报错 cPickle.PicklingError: Can't pickle <type 'function'>: attribute lookup __builtin__.function failed
+        曾经像下面这样写，但是报错 cPickle.PicklingError: Can't pickle <type 'function'>: attribute lookup __builtin__.function failed
         因为多进程之间要使用pickle来序列化并传递一些数据，但是实例方法并不能被pickle
         能被 pickle 的类型列表： https://docs.python.org/2/library/pickle.html#what-can-be-pickled-and-unpickled
 
@@ -102,9 +104,10 @@ def invoke_proc(recv_q, send_q, proc, sentinel, *args, **kwargs):
 
 class SentinelPipelineStep(SentinelPipelineNode):
     """
-    可以多进程运行
+    中间节点之一，可以多进程运行
     每个进程从前一个节点的 queue 中读取数据
     通过转换器转换，把得到的结果插入本节点的 queue 中
+    注意，该类节点每次从 queue 中取出一个数据，就会处理得到一个结果，并把结果放到本节点 queue 中
     """
     def __init__(self, pipeline, proc, num_cores, sentinel):
         super(SentinelPipelineStep, self).__init__(pipeline, proc, num_cores, sentinel)
@@ -115,15 +118,42 @@ class SentinelPipelineStep(SentinelPipelineNode):
             self.processes.append(self.pool.apply_async(invoke_proc, (self.prev_node.queue, self.queue, self.proc, self.sentinel,) + args, kwargs))
 
 
+def data_generator(q, sentinel):
+    """
+    包装从 queue 中取数据的流程，形成一个 generator
+    """
+    while True:
+        rec = q.get()
+        if rec == sentinel:
+            return
+        yield rec
+
+
+def aggreg_proc(recv_q, send_q, proc, sentinel, *args, **kwargs):
+    """
+    从生成器中读取数据，进行处理，最终把全部数据得到一个结果
+    最后把这个结果入 queue
+    """
+    send_q.put(proc(data_generator(recv_q, sentinel), *args, **kwargs))
+
+
+class SentinelPipelineAggreg(SentinelPipelineNode):
+    """
+    中间节点之一，可以多进程运行
+    每个进程从前一个节点的 queue 中读取数据
+    通过累积器转换，把对全部数据的处理结果插入本节点的 queue 中
+    注意，该类节点每次从 queue 中取出一个数据，然后进行累积计算，不停累积，期间并不入 queue；最后把最终累积结果放到本节点 queue 中
+    """
+    def __init__(self, pipeline, proc, num_cores, sentinel):
+        super(SentinelPipelineAggreg, self).__init__(pipeline, proc, num_cores, sentinel)
+        self.queue = self.manager.Queue()
+
+    def run(self, *args, **kwargs):
+        for _ in range(self.num_cores):
+            self.processes.append(self.pool.apply_async(aggreg_proc, (self.prev_node.queue, self.queue, self.proc, self.sentinel,) + args, kwargs))
+
+
 def end_proc(q, proc, sentinel, *args, **kwargs):
-
-    def data_generator(q, sentinel):
-        while True:
-            rec = q.get()
-            if rec == sentinel:
-                return
-            yield rec
-
     return proc(data_generator(q, sentinel), *args, **kwargs)
 
 
@@ -156,23 +186,24 @@ class SentinelPipeline(object):
         start = SentinelPipelineStart(self, proc, num_cores, sentinel)
         self.graph.append([start, args, kwargs])
 
-    def pipe_with(self, proc, num_cores, sentinel, *args, **kwargs):
-        node = SentinelPipelineStep(self, proc, num_cores, sentinel)
+    def pipe_with(self, proc, num_cores, sentinel, nodetype, *args, **kwargs):
+        if nodetype == "step":
+            node = SentinelPipelineStep(self, proc, num_cores, sentinel)
+        elif nodetype == "end":
+            node = SentinelPipelineEnd(self, proc, num_cores, sentinel)
+        elif nodetype == "aggreg":
+            node = SentinelPipelineAggreg(self, proc, num_cores, sentinel)
+        else:
+            raise RuntimeError("wrong node type")
         self.graph[-1][0].set_next_node(node)
         node.set_prev_node(self.graph[-1][0])
         self.graph.append([node, args, kwargs])
-
-    def end_with(self, proc, num_cores, sentinel, *args, **kwargs):
-        end = SentinelPipelineEnd(self, proc, num_cores, sentinel)
-        self.graph[-1][0].set_next_node(end)
-        end.set_prev_node(self.graph[-1][0])
-        self.graph.append([end, args, kwargs])
 
     def run(self):
         # 多进程启动任务节点
         for node, args, kwargs in self.graph:
             node.run(*args, **kwargs)
-        # 设置哨兵
+        # 每个步骤节点运行完毕后，设置哨兵；这里是个阻塞调用
         for node, _, _ in self.graph:
             node.set_sentinels()
         self.pool.close()
